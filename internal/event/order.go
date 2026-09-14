@@ -2,7 +2,7 @@ package event
 
 import "time"
 
-type orderCreated struct {
+type OrderCreated struct {
 	OrderID   string    `json:"order_id"`
 	UserID    string    `json:"user_id"`
 	Amount    int64     `json:"amount"`
