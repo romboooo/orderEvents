@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"orderEvents/internal/event"
 	"time"
 )
 
@@ -14,6 +18,14 @@ type CreateOrderRequest struct {
 
 type CreateOrderResponse struct {
 	Status string `json:"status"`
+}
+
+func generateOrderID() (string, error) {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", fmt.Errorf("generate random order id: %w", err)
+	}
+	return hex.EncodeToString(bytes[:]), nil
 }
 
 func createOrderHandler(w http.ResponseWriter, r *http.Request) {
@@ -35,6 +47,29 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "amount must be positive digit", http.StatusBadRequest)
 		return
 	}
+
+	orderID, err := generateOrderID()
+	if err != nil {
+		log.Printf("failed to generate order id: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	orderEvent := event.OrderCreated{
+		OrderID:   orderID,
+		UserID:    request.UserID,
+		Amount:    request.Amount,
+		CreatedAt: time.Now().UTC(),
+	}
+	payload, err := json.Marshal(orderEvent)
+
+	if err != nil {
+		log.Printf("failed to marshal order event: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	//todo дописать
 
 	response := CreateOrderResponse{
 		Status: "accepted!",
