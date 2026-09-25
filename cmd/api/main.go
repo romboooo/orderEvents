@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,8 @@ import (
 	"net/http"
 	"orderEvents/internal/event"
 	"time"
+
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 type CreateOrderRequest struct {
@@ -17,7 +20,8 @@ type CreateOrderRequest struct {
 }
 
 type CreateOrderResponse struct {
-	Status string `json:"status"`
+	Status  string `json:"status"`
+	OrderID string `json:"order_id"`
 }
 
 func generateOrderID() (string, error) {
@@ -28,65 +32,107 @@ func generateOrderID() (string, error) {
 	return hex.EncodeToString(bytes[:]), nil
 }
 
-func createOrderHandler(w http.ResponseWriter, r *http.Request) {
-	var request CreateOrderRequest
+func createOrderHandler(client *kgo.Client) http.HandlerFunc {
 
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
+	return func(w http.ResponseWriter, r *http.Request) {
+		var request CreateOrderRequest
 
-	if err := decoder.Decode(&request); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
 
-	if request.UserID == "" {
-		http.Error(w, "user id is required", http.StatusBadRequest)
-		return
-	}
-	if request.Amount <= 0 {
-		http.Error(w, "amount must be positive digit", http.StatusBadRequest)
-		return
-	}
+		if err := decoder.Decode(&request); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
 
-	orderID, err := generateOrderID()
-	if err != nil {
-		log.Printf("failed to generate order id: %v", err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
-		return
-	}
+		if request.UserID == "" {
+			http.Error(w, "user_id is required", http.StatusBadRequest)
+			return
+		}
+		if request.Amount <= 0 {
+			http.Error(w, "amount must be positive", http.StatusBadRequest)
+			return
+		}
 
-	orderEvent := event.OrderCreated{
-		OrderID:   orderID,
-		UserID:    request.UserID,
-		Amount:    request.Amount,
-		CreatedAt: time.Now().UTC(),
-	}
-	payload, err := json.Marshal(orderEvent)
+		orderID, err := generateOrderID()
+		if err != nil {
+			log.Printf("failed to generate order id: %v", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
 
-	if err != nil {
-		log.Printf("failed to marshal order event: %v", err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
-		return
-	}
+		orderEvent := event.OrderCreated{
+			OrderID:   orderID,
+			UserID:    request.UserID,
+			Amount:    request.Amount,
+			CreatedAt: time.Now().UTC(),
+		}
+		payload, err := json.Marshal(orderEvent)
 
-	//todo дописать
+		if err != nil {
+			log.Printf("failed to marshal order event: %v", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
 
-	response := CreateOrderResponse{
-		Status: "accepted!",
-	}
+		record := &kgo.Record{
+			Topic: "orders.created",
+			Key:   []byte(orderEvent.OrderID),
+			Value: payload,
+		}
 
-	w.Header().Set("Content=Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
+		produceCtx, cancelProduce := context.WithTimeout(
+			r.Context(),
+			5*time.Second,
+		)
 
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("failed to encode response: %v", err)
+		defer cancelProduce()
+
+		results := client.ProduceSync(produceCtx, record)
+
+		if err := results.FirstErr(); err != nil {
+			log.Printf("failed to produce order event: %v", err)
+			http.Error(w, "kafka is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
+		log.Printf(
+			"record produced: topic=%s, key=%s, value=%s",
+			record.Topic,
+			record.Key,
+			record.Value,
+		)
+
+		response := CreateOrderResponse{
+			Status:  "accepted!",
+			OrderID: orderEvent.OrderID,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			log.Printf("failed to encode response: %v", err)
+		}
 	}
 }
 
 func main() {
+
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("localhost:9092"),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+	)
+
+	if err != nil {
+		log.Fatalf("failed to create kafka client: %v", err)
+	}
+
+	defer client.Close()
+
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /orders", createOrderHandler)
+	mux.HandleFunc("POST /orders", createOrderHandler(client))
 
 	server := &http.Server{
 		Addr:              ":8080",
